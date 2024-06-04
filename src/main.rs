@@ -446,8 +446,12 @@ fn wine_bin() -> String {
     return env::var("WINE").ok().unwrap_or_else(|| "wine".to_string());
 }
 
+fn wineserver_bin() -> String {
+    return env::var("WINESERVER").ok().unwrap_or_else(|| "wineserver".to_string());
+}
+
 fn wine_hostname(config: &BasisLatestConfig, prefix_path: &Path) -> Result<(), loga::Error> {
-    Command::new("wine").arg("hostname").envs(wine_envs(config, prefix_path)).stdout(Stdio::null()).run()?;
+    Command::new(wine_bin()).arg("hostname").envs(wine_envs(config, prefix_path)).stdout(Stdio::null()).run()?;
     return Ok(());
 }
 
@@ -604,12 +608,21 @@ fn main() {
                     let command_args = args.command.split_off(1);
                     let command_command =
                         drive_c_path.join(args.command.pop().context("Command line to run in system is empty")?);
+                    let env = wine_envs(&basis_config, &mount_path);
                     Command::new(wine_bin())
-                        .envs(wine_envs(&basis_config, &mount_path))
-                        .current_dir(&args.working_dir.unwrap_or(drive_c_path))
+                        .envs(&env)
+                        .current_dir(
+                            &args
+                                .working_dir
+                                .as_ref()
+                                .map(|x| x.as_path())
+                                .or(command_command.parent())
+                                .unwrap_or(drive_c_path.as_path()),
+                        )
                         .arg(command_command)
                         .args(command_args)
                         .run()?;
+                    Command::new(wineserver_bin()).envs(&env).arg("-w").run()?;
                 },
                 SystemArgs::Path { system_name } => {
                     let system_path = system_path(&system_name)?;
