@@ -14,9 +14,8 @@ use {
         ea,
         fatal,
         DebugDisplay,
+        Log,
         ResultContext,
-        StandardFlag,
-        StandardLog,
     },
     os_pipe::pipe,
     serde::{
@@ -25,7 +24,6 @@ use {
     },
     shlex::bytes::try_quote,
     std::{
-        cell::OnceCell,
         collections::HashMap,
         env::{
             self,
@@ -59,7 +57,7 @@ use {
             Command,
             Stdio,
         },
-        rc::Rc,
+        sync::OnceLock,
     },
 };
 
@@ -110,7 +108,7 @@ struct BasisShellArgs {
 }
 
 #[derive(Aargvark)]
-#[vark(break)]
+#[vark(break_help)]
 enum BasisArgs {
     /// Create a new basis
     Create(BasisCreateArgs),
@@ -149,7 +147,7 @@ struct SystemRunArgs {
 }
 
 #[derive(Aargvark)]
-#[vark(break)]
+#[vark(break_help)]
 enum SystemArgs {
     /// Create a new system using the specified basis.
     Create {
@@ -171,42 +169,27 @@ enum SystemArgs {
 }
 
 #[derive(Aargvark)]
-#[vark(break)]
-enum Args {
+#[vark(break_help)]
+enum ArgCommand {
     System(SystemArgs),
     Basis(BasisArgs),
 }
 
-trait ToOsString {
-    fn to_os_str(&self) -> OsString;
-}
-
-impl ToOsString for [u8] {
-    fn to_os_str(&self) -> OsString {
-        return OsStr::from_bytes(self).to_os_string();
-    }
-}
-
-impl ToOsString for str {
-    fn to_os_str(&self) -> OsString {
-        return self.as_bytes().to_os_str();
-    }
-}
-
-impl ToOsString for String {
-    fn to_os_str(&self) -> OsString {
-        return self.as_bytes().to_os_str();
-    }
+#[derive(Aargvark)]
+struct Args {
+    command: ArgCommand,
+    debug: Option<()>,
 }
 
 trait CommandRun {
-    fn run(&mut self) -> Result<(), loga::Error>;
+    fn run(&mut self, log: &Log) -> Result<(), loga::Error>;
     fn run_stdin(&mut self, stdin: &[u8]) -> Result<(), loga::Error>;
 }
 
 impl CommandRun for Command {
-    fn run(&mut self) -> Result<(), loga::Error> {
-        let log = StandardLog::new().fork(ea!(command = self.dbg_str()));
+    fn run(&mut self, log: &Log) -> Result<(), loga::Error> {
+        let log = log.fork(ea!(command = self.dbg_str()));
+        log.log(loga::DEBUG, "Running command");
         let res =
             self
                 .spawn()
@@ -220,7 +203,7 @@ impl CommandRun for Command {
     }
 
     fn run_stdin(&mut self, stdin: &[u8]) -> Result<(), loga::Error> {
-        let log = StandardLog::new().fork(ea!(command = self.dbg_str()));
+        let log = Log::new().fork(ea!(command = self.dbg_str()));
         self.stdin(Stdio::piped());
         let mut child = self.spawn().stack_context(&log, "Error starting shell")?;
         let mut child_stdin = child.stdin.take().unwrap();
@@ -253,11 +236,7 @@ fn quote_subcommand<'a>(subcommand: impl IntoIterator<Item = &'a [u8]>) -> Resul
 }
 
 #[allow(dyn_drop)]
-fn mount_prefix(
-    log: &StandardLog,
-    basis_path: &Path,
-    system_path: &Path,
-) -> Result<(Box<dyn Drop>, PathBuf), loga::Error> {
+fn mount_prefix(log: &Log, basis_path: &Path, system_path: &Path) -> Result<(Box<dyn Drop>, PathBuf), loga::Error> {
     let root_dir = root_dir()?;
     let tempdirs_path = root_dir.join("temp");
     create_dir_all(
@@ -334,13 +313,13 @@ fn mount_prefix(
                     let res = sudo.wait_with_output()?;
                     if !res.status.success() {
                         log.log_with(
-                            StandardFlag::Warning,
+                            loga::WARN,
                             "Cleanup sudo process exited with error",
                             ea!(output = res.dbg_str()),
                         );
                     }
                     return Ok(()) as Result<_, loga::Error>;
-                })().log(&log, StandardFlag::Warning, "Error completing cleanup");
+                })().log(&log, loga::WARN, "Error completing cleanup");
             }
         })),
         // Useful return
@@ -355,10 +334,15 @@ fn shell_commandline(basis_config: &BasisLatestConfig, prefix_path: &Path) -> Co
     return commandline;
 }
 
-fn run_shell(basis_config: &BasisLatestConfig, prefix_path: &Path, command: Vec<String>) -> Result<(), loga::Error> {
+fn run_shell(
+    log: &Log,
+    basis_config: &BasisLatestConfig,
+    prefix_path: &Path,
+    command: Vec<String>,
+) -> Result<(), loga::Error> {
     let mut commandline = shell_commandline(basis_config, prefix_path);
     if command.is_empty() {
-        commandline.run()?;
+        commandline.run(log)?;
     } else {
         let cwd = current_dir().context("Can't determine current dir")?;
         let command = command.into_iter().map(|x| {
@@ -373,15 +357,15 @@ fn run_shell(basis_config: &BasisLatestConfig, prefix_path: &Path, command: Vec<
     return Ok(());
 }
 
-fn root_dir() -> Result<Rc<PathBuf>, loga::Error> {
-    static mut PROJECT_DIRS: OnceCell<Result<Rc<PathBuf>, loga::Error>> = OnceCell::new();
-    return unsafe {
-        PROJECT_DIRS.get_or_init(
+fn root_dir() -> Result<PathBuf, loga::Error> {
+    static PROJECT_DIRS: OnceLock<Result<PathBuf, loga::Error>> = OnceLock::new();
+    return PROJECT_DIRS
+        .get_or_init(
             || ProjectDirs::from("", "", "winebasin")
                 .context("Could not determine system directories")
-                .map(|x| Rc::new(x.data_dir().to_path_buf())),
+                .map(|x| x.data_dir().to_path_buf()),
         )
-    }.clone();
+        .clone();
 }
 
 fn basis_path(name: &str) -> Result<PathBuf, loga::Error> {
@@ -397,7 +381,7 @@ fn basis_prefix_path(basis_path: &Path) -> PathBuf {
 }
 
 fn basis_needs_update(basis_path: &Path) -> Result<bool, loga::Error> {
-    let log = StandardLog::new().fork(ea!(path = basis_path.to_string_lossy()));
+    let log = Log::new().fork(ea!(path = basis_path.to_string_lossy()));
     if !basis_path.exists() {
         return Err(log.err("Basis doesn't exist"));
     }
@@ -450,12 +434,16 @@ fn wineserver_bin() -> String {
     return env::var("WINESERVER").ok().unwrap_or_else(|| "wineserver".to_string());
 }
 
-fn wine_hostname(config: &BasisLatestConfig, prefix_path: &Path) -> Result<(), loga::Error> {
-    Command::new(wine_bin()).arg("hostname").envs(wine_envs(config, prefix_path)).stdout(Stdio::null()).run()?;
+fn wine_hostname(log: &Log, config: &BasisLatestConfig, prefix_path: &Path) -> Result<(), loga::Error> {
+    Command::new(wine_bin())
+        .arg("hostname")
+        .envs(wine_envs(config, prefix_path))
+        .stdout(Stdio::null())
+        .run(log)?;
     return Ok(());
 }
 
-fn update_basis(basis_path: &Path) -> Result<BasisLatestConfig, loga::Error> {
+fn update_basis(log: &Log, basis_path: &Path) -> Result<BasisLatestConfig, loga::Error> {
     let config_path = basis_config_path(basis_path);
     let config =
         match serde_json::from_slice::<BasisConfig>(
@@ -469,7 +457,7 @@ fn update_basis(basis_path: &Path) -> Result<BasisLatestConfig, loga::Error> {
         return Ok(config);
     }
     let prefix_path = basis_prefix_path(basis_path);
-    wine_hostname(&config, &prefix_path)?;
+    wine_hostname(log, &config, &prefix_path)?;
     return Ok(config);
 }
 
@@ -509,9 +497,12 @@ fn check_system(system_path: &Path) -> Result<SystemLatestConfig, loga::Error> {
 fn main() {
     match (|| {
         let args = vark::<Args>();
-        let log = StandardLog::new().with_flags(&[StandardFlag::Error, StandardFlag::Warning, StandardFlag::Info]);
-        match args {
-            Args::Basis(args) => match args {
+        let log = Log::new_root(match args.debug.is_some() {
+            true => loga::DEBUG,
+            false => loga::INFO,
+        });
+        match args.command {
+            ArgCommand::Basis(args) => match args {
                 BasisArgs::Create(args) => {
                     let basis_path = basis_path(&args.basis_name)?;
                     let log = log.fork(ea!(path = basis_path.to_string_lossy()));
@@ -533,7 +524,7 @@ fn main() {
                         ea!(config = config_path.to_string_lossy()),
                     )?;
                     let prefix_path = basis_prefix_path(&basis_path);
-                    wine_hostname(&config, &prefix_path)?;
+                    wine_hostname(&log, &config, &prefix_path)?;
                     if args.recommended_winetricks.is_some() {
                         let mut commandline = shell_commandline(&config, &prefix_path);
                         match arch {
@@ -552,22 +543,22 @@ fn main() {
                 },
                 BasisArgs::Update { basis_name } => {
                     let basis_path = basis_path(&basis_name)?;
-                    update_basis(&basis_path)?;
+                    update_basis(&log, &basis_path)?;
                 },
                 BasisArgs::Shell(args) => {
                     let basis_path = basis_path(&args.basis_name)?;
-                    let basis_config = update_basis(&basis_path)?;
+                    let basis_config = update_basis(&log, &basis_path)?;
                     let log = log.fork(ea!(path = basis_path.to_string_lossy()));
                     if !basis_path.exists() {
                         return Err(log.err("Basis doesn't exist"));
                     }
-                    run_shell(&basis_config, &basis_prefix_path(&basis_path), args.command)?;
+                    run_shell(&log, &basis_config, &basis_prefix_path(&basis_path), args.command)?;
                 },
                 BasisArgs::Path { basis_name } => {
                     print!("{}", basis_path(&basis_name)?.to_string_lossy());
                 },
             },
-            Args::System(args) => match args {
+            ArgCommand::System(args) => match args {
                 SystemArgs::Create { basis_name, system_name } => {
                     let system_path = system_path(&system_name)?;
                     create_dir_all(
@@ -594,15 +585,15 @@ fn main() {
                     let system_path = system_path(&args.system_name)?;
                     let system_config = check_system(&system_path)?;
                     let basis_path = basis_path(&system_config.basis_name)?;
-                    let basis_config = update_basis(&basis_path)?;
+                    let basis_config = update_basis(&log, &basis_path)?;
                     let (_mount, mount_path) = mount_prefix(&log, &basis_path, &system_path)?;
-                    run_shell(&basis_config, &mount_path, args.command)?;
+                    run_shell(&log, &basis_config, &mount_path, args.command)?;
                 },
                 SystemArgs::Run(mut args) => {
                     let system_path = system_path(&args.system_name)?;
                     let system_config = check_system(&system_path)?;
                     let basis_path = basis_path(&system_config.basis_name)?;
-                    let basis_config = update_basis(&basis_path)?;
+                    let basis_config = update_basis(&log, &basis_path)?;
                     let (_mount, mount_path) = mount_prefix(&log, &basis_path, &system_path)?;
                     let drive_c_path = mount_path.join("drive_c");
                     let command_args = args.command.split_off(1);
@@ -621,8 +612,8 @@ fn main() {
                         )
                         .arg(command_command)
                         .args(command_args)
-                        .run()?;
-                    Command::new(wineserver_bin()).envs(&env).arg("-w").run()?;
+                        .run(&log)?;
+                    Command::new(wineserver_bin()).envs(&env).arg("-w").run(&log)?;
                 },
                 SystemArgs::Path { system_name } => {
                     let system_path = system_path(&system_name)?;
